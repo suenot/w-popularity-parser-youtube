@@ -131,7 +131,7 @@ func (p *YouTubeParser) fetchChannelYTDLP(ctx context.Context, bin, handle strin
 		"--no-warnings",
 		"--no-call-home",
 		"--ignore-config",
-		"--playlist-end", "0",
+		"--playlist-items", "0",
 		"https://www.youtube.com/@" + handle + "/about",
 	}
 	entry, err := p.runYTDLP(ctx, bin, args)
@@ -148,7 +148,7 @@ func (p *YouTubeParser) fetchChannelYTDLP(ctx context.Context, bin, handle strin
 			"--no-warnings",
 			"--no-call-home",
 			"--ignore-config",
-			"--playlist-end", "0",
+			"--playlist-items", "0",
 			"https://www.youtube.com/@" + handle + "/videos",
 		}
 		e2, err := p.runYTDLP(ctx, bin, args2)
