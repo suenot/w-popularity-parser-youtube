@@ -3,81 +3,103 @@ package parser
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
-	"runtime"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	shared "github.com/suenot/w-popularity-shared"
 )
 
-// writeFakeYTDLP writes an executable shell script to a temp dir that emits
-// `payload` to stdout and returns `exitCode`. `stderr` is written verbatim to
-// the script's stderr. It returns the absolute path of the script.
-func writeFakeYTDLP(t *testing.T, payload, stderrMsg string, exitCode int) string {
+// --- test plumbing ----------------------------------------------------------
+
+// newWithServer wires the parser to send every youtube.com request to the
+// provided httptest.Server. The Path/Query are preserved so the handler can
+// route on `/@<handle>/about` etc.
+func newWithServer(t *testing.T, srv *httptest.Server) *YouTubeParser {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("fake yt-dlp shell script only runs on unix")
-	}
-	dir := t.TempDir()
-	path := filepath.Join(dir, "yt-dlp")
-
-	// Write payload and stderr to sibling files; the script cats them.
-	stdoutFile := filepath.Join(dir, "stdout.json")
-	stderrFile := filepath.Join(dir, "stderr.txt")
-	if err := os.WriteFile(stdoutFile, []byte(payload), 0o644); err != nil {
+	target, err := url.Parse(srv.URL)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(stderrFile, []byte(stderrMsg), 0o644); err != nil {
-		t.Fatal(err)
+	client := &http.Client{
+		Transport: rewriteRT{target: target, next: http.DefaultTransport},
+		Timeout:   5 * time.Second,
 	}
-
-	script := "#!/bin/sh\n" +
-		"cat " + stdoutFile + "\n" +
-		"cat " + stderrFile + " 1>&2\n" +
-		"exit " + itoa(exitCode) + "\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
+	p := New(Config{HTTPClient: client})
+	// Pin "now" so relative-date math is deterministic in tests.
+	p.now = func() time.Time {
+		return time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
 	}
-	return path
+	return p
 }
 
-func itoa(n int) string {
-	// avoid pulling in strconv just for testing.
-	if n == 0 {
-		return "0"
-	}
-	neg := false
-	if n < 0 {
-		neg = true
-		n = -n
-	}
-	buf := make([]byte, 0, 4)
-	for n > 0 {
-		buf = append([]byte{byte('0' + n%10)}, buf...)
-		n /= 10
-	}
-	if neg {
-		return "-" + string(buf)
-	}
-	return string(buf)
+type rewriteRT struct {
+	target *url.URL
+	next   http.RoundTripper
 }
 
-// --- FetchChannel via yt-dlp -------------------------------------------------
+func (r rewriteRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Host, "youtube.com") {
+		req2 := req.Clone(req.Context())
+		req2.URL.Scheme = r.target.Scheme
+		req2.URL.Host = r.target.Host
+		req2.Host = r.target.Host
+		return r.next.RoundTrip(req2)
+	}
+	return r.next.RoundTrip(req)
+}
 
-func TestFetchChannel_YTDLP_Happy(t *testing.T) {
-	payload := `{
-		"id": "@mm",
-		"channel_id": "UC123",
-		"title": "MarketMaker",
-		"channel_follower_count": 50000,
-		"view_count": 1000000,
-		"playlist_count": 120
-	}`
-	bin := writeFakeYTDLP(t, payload, "", 0)
+// htmlWithInitialData wraps the given ytInitialData JSON in a minimal HTML
+// document shaped like a real YouTube page.
+func htmlWithInitialData(json string) string {
+	return `<!DOCTYPE html><html><head><title>YouTube</title></head><body>` +
+		`<script nonce="x">var ytInitialData = ` + json + `;</script>` +
+		`</body></html>`
+}
 
-	p := New(Config{YTDLPPath: bin})
+// --- FetchChannel: new aboutChannelViewModel shape --------------------------
+
+func TestFetchChannel_AboutChannelViewModel(t *testing.T) {
+	body := htmlWithInitialData(`{
+		"metadata": {
+			"channelMetadataRenderer": {
+				"title": "MarketMaker",
+				"externalId": "UCabc123channel"
+			}
+		},
+		"contents": {
+			"twoColumnBrowseResultsRenderer": {
+				"tabs": [{"tabRenderer": {
+					"content": {"sectionListRenderer": {"contents": [{
+						"itemSectionRenderer": {"contents": [{
+							"channelAboutFullMetadataRenderer": {
+								"aboutChannelViewModel": {
+									"subscriberCountText": "1.2M subscribers",
+									"viewCountText": "15,000,000 views",
+									"videoCountText": "234 videos",
+									"channelId": "UCabc123channel"
+								}
+							}
+						}]}
+					}]}}
+				}}]
+			}
+		}
+	}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/about") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := newWithServer(t, srv)
 	snap, err := p.FetchChannel(context.Background(), "@mm")
 	if err != nil {
 		t.Fatalf("FetchChannel: %v", err)
@@ -88,127 +110,343 @@ func TestFetchChannel_YTDLP_Happy(t *testing.T) {
 	if snap.Handle != "mm" {
 		t.Fatalf("handle: %s", snap.Handle)
 	}
-	if snap.Followers != 50000 || snap.PostsCount != 120 || snap.TotalViews != 1000000 {
-		t.Fatalf("counts: %+v", snap)
+	if snap.Followers != 1_200_000 {
+		t.Fatalf("followers: got %d, want 1_200_000", snap.Followers)
 	}
-	if cid, _ := snap.Raw["channel_id"].(string); cid != "UC123" {
-		t.Fatalf("missing channel_id: %+v", snap.Raw)
+	if snap.TotalViews != 15_000_000 {
+		t.Fatalf("total_views: got %d, want 15_000_000", snap.TotalViews)
 	}
-	if src, _ := snap.Raw["source"].(string); src != "yt-dlp" {
+	if snap.PostsCount != 234 {
+		t.Fatalf("posts_count: got %d, want 234", snap.PostsCount)
+	}
+	if id, _ := snap.Raw["channel_id"].(string); id != "UCabc123channel" {
+		t.Fatalf("channel_id: %v", snap.Raw["channel_id"])
+	}
+	if src, _ := snap.Raw["source"].(string); src != "html" {
 		t.Fatalf("source: %v", snap.Raw["source"])
+	}
+	if snap.URL != "https://www.youtube.com/@mm" {
+		t.Fatalf("url: %s", snap.URL)
 	}
 }
 
-func TestFetchChannel_YTDLP_PrivateNotFound(t *testing.T) {
-	bin := writeFakeYTDLP(t, "", "ERROR: This channel does not exist.\n", 1)
-	p := New(Config{YTDLPPath: bin})
+// --- FetchChannel: legacy c4TabbedHeaderRenderer shape ----------------------
+
+func TestFetchChannel_LegacyC4TabbedHeader(t *testing.T) {
+	body := htmlWithInitialData(`{
+		"header": {
+			"c4TabbedHeaderRenderer": {
+				"channelId": "UCold",
+				"title": "Legacy Channel",
+				"subscriberCountText": {"simpleText": "123K subscribers"},
+				"videosCountText": {"runs": [{"text": "50"}, {"text": " videos"}]}
+			}
+		},
+		"metadata": {
+			"channelMetadataRenderer": {
+				"externalId": "UCold",
+				"title": "Legacy Channel"
+			}
+		},
+		"contents": {
+			"twoColumnBrowseResultsRenderer": {
+				"tabs": [{"tabRenderer": {
+					"content": {"sectionListRenderer": {"contents": [{
+						"itemSectionRenderer": {"contents": [{
+							"channelAboutFullMetadataRenderer": {
+								"viewCountText": {"simpleText": "1,234,567 views"}
+							}
+						}]}
+					}]}}
+				}}]
+			}
+		}
+	}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := newWithServer(t, srv)
+	snap, err := p.FetchChannel(context.Background(), "legacy")
+	if err != nil {
+		t.Fatalf("FetchChannel: %v", err)
+	}
+	if snap.Followers != 123_000 {
+		t.Fatalf("followers: got %d, want 123_000", snap.Followers)
+	}
+	if snap.PostsCount != 50 {
+		t.Fatalf("posts_count: got %d, want 50", snap.PostsCount)
+	}
+	if snap.TotalViews != 1_234_567 {
+		t.Fatalf("views: got %d, want 1_234_567", snap.TotalViews)
+	}
+	if id, _ := snap.Raw["channel_id"].(string); id != "UCold" {
+		t.Fatalf("channel_id: %v", snap.Raw["channel_id"])
+	}
+}
+
+// --- FetchChannel: newer pageHeaderRenderer fallback walk -------------------
+
+func TestFetchChannel_PageHeaderRendererFallback(t *testing.T) {
+	// In this shape there is no aboutChannelViewModel and no
+	// c4TabbedHeaderRenderer — counts live inside pageHeaderViewModel's
+	// metadataRows[].metadataParts[].text.content as plain strings.
+	body := htmlWithInitialData(`{
+		"header": {
+			"pageHeaderRenderer": {
+				"pageTitle": "PageHeader Channel",
+				"content": {
+					"pageHeaderViewModel": {
+						"metadata": {
+							"contentMetadataViewModel": {
+								"metadataRows": [
+									{"metadataParts": [
+										{"text": {"content": "@phc"}},
+										{"text": {"content": "487M subscribers"}},
+										{"text": {"content": "980 videos"}}
+									]}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		"metadata": {
+			"channelMetadataRenderer": {
+				"externalId": "UCxxxxxxxxxxxxxxxxxxxxxx",
+				"title": "PageHeader Channel"
+			}
+		}
+	}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := newWithServer(t, srv)
+	snap, err := p.FetchChannel(context.Background(), "phc")
+	if err != nil {
+		t.Fatalf("FetchChannel: %v", err)
+	}
+	if snap.Followers != 487_000_000 {
+		t.Fatalf("followers: got %d, want 487_000_000", snap.Followers)
+	}
+	if snap.PostsCount != 980 {
+		t.Fatalf("posts_count: got %d, want 980", snap.PostsCount)
+	}
+	if id, _ := snap.Raw["channel_id"].(string); id != "UCxxxxxxxxxxxxxxxxxxxxxx" {
+		t.Fatalf("channel_id: %v", snap.Raw["channel_id"])
+	}
+}
+
+// --- FetchRecentPosts: lockupViewModel shape, since-filter ------------------
+
+func TestFetchRecentPosts_LockupViewModel(t *testing.T) {
+	// 3 videos: 2 days ago (fresh), 3 weeks ago (fresh-ish), 2 years ago (old).
+	// `since` = 30 days back from fixed `now`; only the first two survive.
+	body := htmlWithInitialData(`{
+		"contents": {"twoColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {
+			"content": {"richGridRenderer": {"contents": [
+				{"richItemRenderer": {"content": {"lockupViewModel": {
+					"contentId": "vidFRESH",
+					"metadata": {"lockupMetadataViewModel": {
+						"title": {"content": "Fresh Upload"},
+						"metadata": {"contentMetadataViewModel": {"metadataRows": [
+							{"metadataParts": [
+								{"text": {"content": "43M views"}},
+								{"text": {"content": "2 days ago"}}
+							]}
+						]}}
+					}}
+				}}}},
+				{"richItemRenderer": {"content": {"lockupViewModel": {
+					"contentId": "vidMID",
+					"metadata": {"lockupMetadataViewModel": {
+						"title": {"content": "Three Weeks Old"},
+						"metadata": {"contentMetadataViewModel": {"metadataRows": [
+							{"metadataParts": [
+								{"text": {"content": "1.5K views"}},
+								{"text": {"content": "3 weeks ago"}}
+							]}
+						]}}
+					}}
+				}}}},
+				{"richItemRenderer": {"content": {"lockupViewModel": {
+					"contentId": "vidOLD",
+					"metadata": {"lockupMetadataViewModel": {
+						"title": {"content": "Ancient"},
+						"metadata": {"contentMetadataViewModel": {"metadataRows": [
+							{"metadataParts": [
+								{"text": {"content": "999 views"}},
+								{"text": {"content": "2 years ago"}}
+							]}
+						]}}
+					}}
+				}}}}
+			]}}
+		}}]}}
+	}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/videos") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := newWithServer(t, srv)
+	// `now` is 2026-05-18, so since = 2026-04-13 keeps "2 days" and
+	// "3 weeks" (~21d ago = 2026-04-27) but drops "2 years".
+	since := time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC)
+	posts, err := p.FetchRecentPosts(context.Background(), "@mb", since)
+	if err != nil {
+		t.Fatalf("FetchRecentPosts: %v", err)
+	}
+	if len(posts) != 2 {
+		t.Fatalf("want 2 posts after since filter, got %d: %+v", len(posts), posts)
+	}
+
+	want := map[string]struct {
+		views int64
+		title string
+	}{
+		"vidFRESH": {43_000_000, "Fresh Upload"},
+		"vidMID":   {1_500, "Three Weeks Old"},
+	}
+	for _, got := range posts {
+		w, ok := want[got.PostID]
+		if !ok {
+			t.Fatalf("unexpected post id: %s", got.PostID)
+		}
+		if got.Views != w.views {
+			t.Fatalf("views for %s: got %d want %d", got.PostID, got.Views, w.views)
+		}
+		if title, _ := got.Raw["title"].(string); title != w.title {
+			t.Fatalf("title for %s: got %v want %s", got.PostID, got.Raw["title"], w.title)
+		}
+		if got.URL != "https://www.youtube.com/watch?v="+got.PostID {
+			t.Fatalf("url: %s", got.URL)
+		}
+		if got.Kind != shared.PostKindVideo {
+			t.Fatalf("kind: %s", got.Kind)
+		}
+		if got.PublishedAt.IsZero() {
+			t.Fatalf("published_at zero for %s", got.PostID)
+		}
+		if got.ChannelHandle != "mb" {
+			t.Fatalf("channel_handle: %s", got.ChannelHandle)
+		}
+	}
+}
+
+// --- FetchRecentPosts: older videoRenderer shape ----------------------------
+
+func TestFetchRecentPosts_VideoRendererShape(t *testing.T) {
+	body := htmlWithInitialData(`{
+		"contents": {"twoColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {
+			"content": {"sectionListRenderer": {"contents": [{
+				"itemSectionRenderer": {"contents": [{
+					"gridRenderer": {"items": [
+						{"gridVideoRenderer": {
+							"videoId": "old1",
+							"title": {"runs": [{"text": "Old Style Video"}]},
+							"publishedTimeText": {"simpleText": "1 week ago"},
+							"viewCountText": {"simpleText": "12,345 views"}
+						}}
+					]}
+				}]}
+			}]}}
+		}}]}}
+	}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	p := newWithServer(t, srv)
+	posts, err := p.FetchRecentPosts(context.Background(), "@vr", time.Time{})
+	if err != nil {
+		t.Fatalf("FetchRecentPosts: %v", err)
+	}
+	if len(posts) != 1 {
+		t.Fatalf("want 1 post, got %d", len(posts))
+	}
+	got := posts[0]
+	if got.PostID != "old1" || got.Views != 12_345 {
+		t.Fatalf("post: %+v", got)
+	}
+}
+
+// --- error cases ------------------------------------------------------------
+
+func TestFetchChannel_404(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	p := newWithServer(t, srv)
 	_, err := p.FetchChannel(context.Background(), "@nope")
 	if !errors.Is(err, shared.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
 
-func TestFetchChannel_YTDLP_RateLimited(t *testing.T) {
-	bin := writeFakeYTDLP(t, "", "ERROR: HTTP Error 429: Too Many Requests\n", 1)
-	p := New(Config{YTDLPPath: bin})
+func TestFetchChannel_429(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	p := newWithServer(t, srv)
 	_, err := p.FetchChannel(context.Background(), "@mm")
 	if !errors.Is(err, shared.ErrRateLimited) {
 		t.Fatalf("want ErrRateLimited, got %v", err)
 	}
 }
 
-func TestFetchChannel_YTDLP_TransientFailure(t *testing.T) {
-	bin := writeFakeYTDLP(t, "", "ERROR: Something exploded internally\n", 1)
-	p := New(Config{YTDLPPath: bin})
+func TestFetchChannel_NoYtInitialData(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body>no script here</body></html>`))
+	}))
+	defer srv.Close()
+
+	p := newWithServer(t, srv)
 	_, err := p.FetchChannel(context.Background(), "@mm")
 	if !errors.Is(err, shared.ErrTransient) {
 		t.Fatalf("want ErrTransient, got %v", err)
 	}
-}
-
-// --- FetchRecentPosts via yt-dlp --------------------------------------------
-
-func TestFetchRecentPosts_YTDLP_Happy(t *testing.T) {
-	// Two videos: one fresh, one older than `since`.
-	payload := `{
-		"id": "@mm",
-		"entries": [
-			{
-				"id": "vid1",
-				"title": "fresh",
-				"webpage_url": "https://www.youtube.com/watch?v=vid1",
-				"upload_date": "20260510",
-				"view_count": 1000,
-				"like_count": 50,
-				"comment_count": 7
-			},
-			{
-				"id": "vid2",
-				"title": "older",
-				"upload_date": "20240101",
-				"view_count": 999,
-				"like_count": 9,
-				"comment_count": 1
-			}
-		]
-	}`
-	bin := writeFakeYTDLP(t, payload, "", 0)
-
-	p := New(Config{YTDLPPath: bin})
-	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	posts, err := p.FetchRecentPosts(context.Background(), "@mm", since)
-	if err != nil {
-		t.Fatalf("FetchRecentPosts: %v", err)
-	}
-	if len(posts) != 1 {
-		t.Fatalf("want 1 post after since filter, got %d", len(posts))
-	}
-	got := posts[0]
-	if got.PostID != "vid1" || got.Likes != 50 || got.Views != 1000 || got.Comments != 7 {
-		t.Fatalf("post mismatch: %+v", got)
-	}
-	if got.Kind != shared.PostKindVideo {
-		t.Fatalf("kind: %s", got.Kind)
-	}
-	if got.URL != "https://www.youtube.com/watch?v=vid1" {
-		t.Fatalf("url: %s", got.URL)
-	}
-	if got.PublishedAt.IsZero() {
-		t.Fatalf("published_at zero")
-	}
-	if got.ChannelHandle != "mm" {
-		t.Fatalf("channel_handle: %s", got.ChannelHandle)
+	if !strings.Contains(err.Error(), "did not contain ytInitialData") {
+		t.Fatalf("error message: %v", err)
 	}
 }
 
-func TestFetchRecentPosts_YTDLP_EmptyEntries(t *testing.T) {
-	payload := `{"id":"@mm","entries":[]}`
-	bin := writeFakeYTDLP(t, payload, "", 0)
+func TestFetchChannel_SoftNotFound(t *testing.T) {
+	// HTTP 200 but with a YouTube alerts[]:{alertRenderer:{type:"ERROR"}} blob.
+	body := htmlWithInitialData(`{
+		"alerts": [{"alertRenderer": {"type": "ERROR", "text": {"simpleText": "This channel does not exist."}}}]
+	}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
 
-	p := New(Config{YTDLPPath: bin})
-	posts, err := p.FetchRecentPosts(context.Background(), "@mm", time.Time{})
-	if err != nil {
-		t.Fatalf("FetchRecentPosts: %v", err)
-	}
-	if len(posts) != 0 {
-		t.Fatalf("want 0 posts, got %d", len(posts))
-	}
-}
-
-// --- yt-dlp missing: ErrAuth when no API key --------------------------------
-
-func TestFetchChannel_NoYTDLPAndNoAPIKey(t *testing.T) {
-	// Force resolveYTDLP() to fail by isolating PATH and pointing YTDLPPath nowhere.
-	t.Setenv("PATH", "/var/empty-doesnt-exist")
-	p := New(Config{}) // no YTDLPPath, no APIKey
-	_, err := p.FetchChannel(context.Background(), "@mm")
-	if !errors.Is(err, shared.ErrAuth) {
-		t.Fatalf("want ErrAuth, got %v", err)
-	}
-
-	_, err = p.FetchRecentPosts(context.Background(), "@mm", time.Time{})
-	if !errors.Is(err, shared.ErrAuth) {
-		t.Fatalf("want ErrAuth for posts, got %v", err)
+	p := newWithServer(t, srv)
+	_, err := p.FetchChannel(context.Background(), "@ghost")
+	if !errors.Is(err, shared.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
 
@@ -218,5 +456,60 @@ func TestPlatform(t *testing.T) {
 	p := New(Config{})
 	if p.Platform() != shared.PlatformYouTube {
 		t.Fatalf("platform: %s", p.Platform())
+	}
+}
+
+// --- unit tests for the numeric helpers -------------------------------------
+
+func TestParseAbbreviatedCount(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   int64
+		wantOK bool
+	}{
+		{"1.2K", 1_200, true},
+		{"5M", 5_000_000, true},
+		{"3.4B", 3_400_000_000, true},
+		{"1,234,567", 1_234_567, true},
+		{"487M subscribers", 487_000_000, true},
+		{"980 videos", 980, true},
+		{"123,020,785,579 views", 123_020_785_579, true},
+		{"  ", 0, false},
+		{"nonsense", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := parseAbbreviatedCount(c.in)
+		if ok != c.wantOK {
+			t.Errorf("parseAbbreviatedCount(%q): ok=%v want %v", c.in, ok, c.wantOK)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parseAbbreviatedCount(%q): got %d want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestParseRelativeDuration(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   time.Duration
+		wantOK bool
+	}{
+		{"3 days ago", 3 * 24 * time.Hour, true},
+		{"2 weeks ago", 14 * 24 * time.Hour, true},
+		{"1 month ago", 30 * 24 * time.Hour, true},
+		{"5 years ago", 5 * 365 * 24 * time.Hour, true},
+		{"3 дня назад", 3 * 24 * time.Hour, true},
+		{"not a date", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := parseRelativeDuration(c.in)
+		if ok != c.wantOK {
+			t.Errorf("parseRelativeDuration(%q): ok=%v want %v", c.in, ok, c.wantOK)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parseRelativeDuration(%q): got %v want %v", c.in, got, c.want)
+		}
 	}
 }
