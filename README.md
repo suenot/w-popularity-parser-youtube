@@ -1,4 +1,4 @@
-# w-popularity-parser-youtube
+# youtube-auto
 
 YouTube parser for [w_popularity](https://github.com/suenot/w-popularity).
 
@@ -31,7 +31,7 @@ The parser is tolerant of **both** YouTube response shapes:
 ## Usage
 
 ```go
-import parser "github.com/suenot/w-popularity-parser-youtube"
+import parser "github.com/suenot/youtube-auto"
 
 p := parser.New(parser.Config{})
 
